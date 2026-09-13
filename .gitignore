@@ -1,0 +1,21 @@
+# シンボリックリンク先の大容量データ（NAS）
+dataset/
+ckpt_weight/
+result/
+fast-reid/
+mmpose/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# コンパイル済みC++拡張
+track/aic_cpp/*.so
+track/aic_cpp/build/
+
+# 実験ログ・一時ファイル
+*.log
+tmp_out/
