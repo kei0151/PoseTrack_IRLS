@@ -1,8 +1,13 @@
 # シンボリックリンク先の大容量データ（NAS）
+dataset
 dataset/
+ckpt_weight
 ckpt_weight/
+result
 result/
+fast-reid
 fast-reid/
+mmpose
 mmpose/
 
 # Python
