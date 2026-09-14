@@ -221,6 +221,7 @@ class PoseTrack():
         self.id = id
         self.update_age = 0
         self.dura_bbox[cam_id] = 1
+        self.get_output()  # populate output_cord for geo re-linking
 
     def triangulation(self, detection_sample_list):
         keypoints_mv = np.zeros((self.num_cam, self.num_keypoints, 3))
@@ -476,8 +477,9 @@ class PoseTracker():
         self.thred_reid = 0.5
         self.upper_body = np.array([5,6,11,12])
         self.current_frame_id = 0
-        self.geo_relink_thresh = 3.0   # distance threshold (meters)
-        self.geo_relink_weight = 0.5   # geo score weight relative to reid score
+        self.geo_relink_thresh = 3.0    # distance threshold (meters)
+        self.geo_relink_weight = 0.5    # geo score weight relative to reid score
+        self.geo_relink_max_gap = 300   # only match tracks missing within this many frames
 
     def compute_reid_aff(self, detection_sample_list_mv, avail_tracks):
         reid_sim_mv = []
@@ -732,10 +734,15 @@ class PoseTracker():
 
             # Geometric similarity: predict where the missing track should be
             if new_world is not None and len(track.world_coord_history) >= 1:
-                frames_elapsed = max(1, self.current_frame_id - track.missing_frame_id)
-                predicted = track.world_coord_history[-1] + track.world_velocity * frames_elapsed
-                dist = np.linalg.norm(predicted - new_world)
-                geo_sim[t_id] = max(0.0, 1.0 - dist / self.geo_relink_thresh)
+                frames_elapsed = self.current_frame_id - track.missing_frame_id
+                if 0 <= frames_elapsed <= self.geo_relink_max_gap:
+                    # Use velocity extrapolation for short gaps, last position for long gaps
+                    if frames_elapsed <= 30:
+                        predicted = track.world_coord_history[-1] + track.world_velocity * frames_elapsed
+                    else:
+                        predicted = track.world_coord_history[-1]
+                    dist = np.linalg.norm(predicted - new_world)
+                    geo_sim[t_id] = max(0.0, 1.0 - dist / self.geo_relink_thresh)
 
         combined = reid_sim + self.geo_relink_weight * geo_sim
         t_id = np.argmax(combined)
