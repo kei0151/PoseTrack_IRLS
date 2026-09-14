@@ -86,6 +86,11 @@ class PoseTrack():
         self.main_joints = np.array([5,6,11,12,13,14,15,16])
         self.upper_body = np.array([5,6,11,12])
 
+        # Geometric track re-linking
+        self.world_coord_history = []   # list of np.array([x, y])
+        self.world_velocity = np.zeros(2)
+        self.missing_frame_id = -1
+
         self.sample_buf = []
         self.unit = np.full((self.num_keypoints,3), 1/np.sqrt(3))
         self.iou_mv = [0 for i in range(self.num_cam)]
@@ -140,28 +145,39 @@ class PoseTrack():
         print("switch ", self.id, track.id, v)
 
 
+    def _update_world_history(self):
+        wx, wy = self.output_cord[0], self.output_cord[1]
+        self.world_coord_history.append(np.array([wx, wy]))
+        if len(self.world_coord_history) > 10:
+            self.world_coord_history.pop(0)
+        if len(self.world_coord_history) >= 2:
+            pts = np.array(self.world_coord_history[-min(5, len(self.world_coord_history)):])
+            self.world_velocity = (pts[-1] - pts[0]) / max(1, len(pts) - 1)
+
     def get_output(self):
         # 3D kp output
 
         for comb in self.output_priority:
             if all(self.age_3D[comb]==0):
                 self.output_cord = np.concatenate((np.mean(self.keypoints_3d[comb,:2],axis=0),[3]))
-                return self.output_cord 
-        
-        #if no 3D kp comb, choose single-view feet 
+                self._update_world_history()
+                return self.output_cord
+
+        #if no 3D kp comb, choose single-view feet
         feet_idxs = self.output_priority[-1]
         for v in self.valid_views:
             if all(self.keypoints_mv[v][feet_idxs,-1]>0.7) and all(self.age_2D[v][feet_idxs]==0):
-                 
+
                 feet_pos = np.mean(self.keypoints_mv[v][feet_idxs,:2], axis=0)
                 feet_homo = self.cameras[v].homo_feet_inv @ np.array([feet_pos[0],feet_pos[1],1])
                 feet_homo = feet_homo[:-1]/feet_homo[-1]
 
                 self.output_cord = np.concatenate((feet_homo,[2]))
+                self._update_world_history()
                 return self.output_cord
 
         # if no single-view feet, then choose bbox bottom point
-            
+
         bottom_points =[]
         for v in self.valid_views:
             bbox = self.bbox_mv[v]
@@ -171,13 +187,13 @@ class PoseTrack():
                 bottom_points.append(bp)
                 continue
             self.output_cord = np.concatenate((bp ,[1]))
-            
+            self._update_world_history()
             return self.output_cord
-            
+
 
         bottom_points = np.array(bottom_points).reshape(-1,2)
         self.output_cord = np.concatenate((np.mean(bottom_points,axis=0),[1]))
-
+        self._update_world_history()
         return self.output_cord
 
 
@@ -459,6 +475,9 @@ class PoseTracker():
         self.bank_size = 30
         self.thred_reid = 0.5
         self.upper_body = np.array([5,6,11,12])
+        self.current_frame_id = 0
+        self.geo_relink_thresh = 3.0   # distance threshold (meters)
+        self.geo_relink_weight = 0.5   # geo score weight relative to reid score
 
     def compute_reid_aff(self, detection_sample_list_mv, avail_tracks):
         reid_sim_mv = []
@@ -694,27 +713,37 @@ class PoseTracker():
             self.tracks.append(new_track)
             print("new init",new_track.id, new_track.valid_views)
             return
-        
+
         reid_sim = np.zeros(len(miss_tracks))
+        geo_sim  = np.zeros(len(miss_tracks))
+
+        # New track world position (set if multi_view_init was called)
+        new_world = new_track.output_cord[:2] if np.any(new_track.output_cord[:2] != 0) else None
+
         for t_id, track in enumerate(miss_tracks):
-            if track.feat_count == 0 or new_track.feat_count == 0:
-                continue
-            if track.feat_count>=self.bank_size:
-                bank = track.feat_bank
-            else:
-                bank = track.feat_bank[:track.feat_count%self.bank_size]
-            new_bank = new_track.feat_bank[:new_track.feat_count%self.bank_size]
-            
-            reid_sim[t_id] = np.max(new_bank @ bank.T)
-        
-        t_id = np.argmax(reid_sim)
+            # ReID similarity
+            if track.feat_count > 0 and new_track.feat_count > 0:
+                if track.feat_count >= self.bank_size:
+                    bank = track.feat_bank
+                else:
+                    bank = track.feat_bank[:track.feat_count % self.bank_size]
+                new_bank = new_track.feat_bank[:new_track.feat_count % self.bank_size]
+                reid_sim[t_id] = np.max(new_bank @ bank.T)
 
-        print("init reid score: ", reid_sim)
-        if reid_sim[t_id]>0.5:
+            # Geometric similarity: predict where the missing track should be
+            if new_world is not None and len(track.world_coord_history) >= 1:
+                frames_elapsed = max(1, self.current_frame_id - track.missing_frame_id)
+                predicted = track.world_coord_history[-1] + track.world_velocity * frames_elapsed
+                dist = np.linalg.norm(predicted - new_world)
+                geo_sim[t_id] = max(0.0, 1.0 - dist / self.geo_relink_thresh)
 
+        combined = reid_sim + self.geo_relink_weight * geo_sim
+        t_id = np.argmax(combined)
+
+        print("init reid score: ", reid_sim, " geo score: ", geo_sim)
+        if combined[t_id] > self.thred_reid:
             miss_tracks[t_id].reactivate(new_track)
             print("reactivate", miss_tracks[t_id].id, miss_tracks[t_id].valid_views)
-
         else:
             self.tracks.append(new_track)
             print("new init",new_track.id, new_track.valid_views)
@@ -840,6 +869,8 @@ class PoseTracker():
         return ret
 
     def mv_update_wo_pred(self, detection_sample_list_mv, frame_id = None):
+        if frame_id is not None:
+            self.current_frame_id = frame_id
 
         um_iou_det_mv = []
         um_ovr_det_mv = []
@@ -955,6 +986,7 @@ class PoseTracker():
                 track.state = TrackState.Deleted
             if track.update_age >=15:
                 track.state = TrackState.Missing
+                track.missing_frame_id = self.current_frame_id
             if track.state == TrackState.Confirmed:
                 track.get_output()
 
