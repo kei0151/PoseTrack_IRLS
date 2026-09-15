@@ -147,6 +147,8 @@ class PoseTrack():
 
     def _update_world_history(self):
         wx, wy = self.output_cord[0], self.output_cord[1]
+        if not (np.isfinite(wx) and np.isfinite(wy)):
+            return  # skip NaN/inf (happens when valid_views is empty)
         self.world_coord_history.append(np.array([wx, wy]))
         if len(self.world_coord_history) > 10:
             self.world_coord_history.pop(0)
@@ -719,8 +721,9 @@ class PoseTracker():
         reid_sim = np.zeros(len(miss_tracks))
         geo_sim  = np.zeros(len(miss_tracks))
 
-        # New track world position (set if multi_view_init was called)
-        new_world = new_track.output_cord[:2] if np.any(new_track.output_cord[:2] != 0) else None
+        # New track world position
+        _nw = new_track.output_cord[:2]
+        new_world = _nw if (np.any(_nw != 0) and np.all(np.isfinite(_nw))) else None
 
         for t_id, track in enumerate(miss_tracks):
             # ReID similarity
